@@ -1,3 +1,5 @@
+# Created by deesnuts69
+
 import os
 import time
 import random  # Added for random selection of mafia killer
