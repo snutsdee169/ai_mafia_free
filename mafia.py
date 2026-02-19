@@ -1,6 +1,7 @@
-import os
 import time
-import random  # Added for random selection of mafia killer
+import random
+import re
+from termcolor import colored
 from dataclasses import dataclass, field
 from typing import List, Optional, Union
 from google import genai 
@@ -8,11 +9,11 @@ from google import genai
 # --- CONFIGURATION ---
 CONFIG = {
     # Replace with your actual key
-    "api_key": "ADD API KEY HERE", 
+    "api_key": "AIzaSyBoHKLKTLVrixkoQmZ8sp4wSluvZ6RjGkc", 
     
     # Game Settings
     "discussion_rounds_per_day": 2,
-    "mafia_discussion_rounds_per_night": 1, # New setting
+    "mafia_discussion_rounds_per_night": 2,
     "max_retries": float("inf"),
     
     # Model Assignments 
@@ -32,9 +33,16 @@ CONFIG = {
         - Mafia kills one person.
         - Doctor saves one person (can save self, cannot save same person twice in a row).
         - Detective investigates one person to learn their role.
-    - If you're asked for analuysis but it's only day/night 1, simply say that nothing's happened so you haven't got anything to say.
+    - If you're asked for analysis but it's only day/night 1, simply say that nothing's happened so you haven't got anything to say.
     - For smooth automation of the game, do not appempt to send a private note to the moderator during discussion time.
     """
+}
+
+ROLE_COLORS = {
+    "Mafia": "red",
+    "Doctor": "blue",
+    "Detective": "magenta", # Termcolor uses magenta for purple
+    "Town": "white"
 }
 
 # --- CLASSES ---
@@ -49,8 +57,15 @@ class Player:
     last_protected_target: str = None 
     private_memory: List[str] = field(default_factory=list)
 
+    @property
+    def colored_name(self) -> str:
+        """Returns the player's name colored based on their role."""
+        color = ROLE_COLORS.get(self.role, "white")
+        return colored(self.name, color)
+
     def __str__(self):
         return f"{self.name} ({self.role})"
+
 
 class LLMInterface:
     """Handles communication with the Google GenAI API."""
@@ -78,21 +93,58 @@ class LLMInterface:
         # --- FIX 2: Clean list of Mafia teammates ---
         mafia_info = ""
         if player.role == "Mafia" and all_players:
-            # Get names of other mafia members (excluding self)
             teammates = [
                 p.name for p in all_players 
                 if p.role == "Mafia" and p.name != player.name
             ]
             mafia_info = f"Your fellow Mafia members are: {', '.join(teammates)}"
 
-        # 2. Construct the System Prompt
+# --- IN THE LLMInterface.generate METHOD ---
+
+# 1. Define Role-Specific Strategic Advice
+        role_strategy = ""
+        if player.role == "Mafia":
+            role_strategy = (
+                "- Be deceptive. Blend in with the Town by acting concerned about the deaths.\n"
+                "- Coordinate subtly. If your teammate is under fire, decide whether to defend them or 'bus' them (vote them out) to look innocent.\n"
+                "- Avoid repeating the exact phrasing of your fellow Mafia members."
+            )
+        elif player.role == "Detective":
+            role_strategy = (
+                "- You have the most power. If you find a Mafia member, you must convince the town to vote them out.\n"
+                "- You can choose to 'claim' your role if necessary, but remember the Mafia will target you at night if you do.\n"
+                "- Use your investigation results as 'strong hunches' or 'certainty' to lead the Town."
+            )
+        elif player.role == "Doctor":
+            role_strategy = (
+                "- Stay alive. You are the only thing keeping the power roles (Detective) safe.\n"
+                "- Pay attention to who is leading the discussion; they are likely the Detective or a target for the Mafia."
+            )
+        else: # Town
+            role_strategy = (
+                "- Look for contradictions and patterns. Who voted for the person who turned out to be an Innocent?\n"
+                "- If someone is making a very specific accusation, consider if they might be the Detective before calling them 'suspicious'.\n"
+                "- Do not be passive. The Mafia wins if you don't find them."
+            )
+
+        # 2. Construct the New System Prompt
         system_prompt = (
-            f"You are {player.name}, assigned the role of {player.role}.\n"
-            f"{mafia_info}\n"  # Insert the clean string here
-            f"The current list of other players who are alive: {others_str}\n" 
-            f"Game Rules: {CONFIG['rules']}\n"
-            f"Current Context:\n{context}\n"
-            f"{self._get_private_context(player)}\n"
+            f"### ROLE IDENTITY\n"
+            f"You are {player.name}, and your secret role is {player.role.upper()}.\n"
+            f"Your winning condition: {'Eliminate all Innocents' if player.role == 'Mafia' else 'Eliminate all Mafia members'}.\n\n"
+            
+            f"### STRATEGIC MANDATE\n"
+            f"{role_strategy}\n"
+            f"- **Survival Instinct:** CRITICAL: You are {player.name}. You are currently alive. Do not, under any circumstances, vote to eliminate yourself. If you think you should vote for {player.name}, you are confused -- you are {player.name}!\n"
+            f"- **Linguistic Diversity:** Do NOT parrot or mimic the phrases used by other players. If others are saying 'this is concerning,' use different language like 'I'm looking at the facts' or 'Something doesn't add up about X'.\n"
+            f"- **Critical Thinking:** Don't just vote because someone is 'quiet' or 'loud.' Look at their voting history.\n\n"
+            
+            f"### CURRENT GAME STATE\n"
+            f"- {mafia_info}\n"
+            f"- Players currently alive: {others_str}\n"
+            f"- Rules: {CONFIG['rules']}\n"
+            f"- History of events:\n{context}\n"
+            f"{self._get_private_context(player)}"
         )
 
         if distinct_action:
@@ -106,18 +158,17 @@ class LLMInterface:
                     model=player.model_id,
                     contents=full_prompt
                 )
-                # On success, return the value (this breaks the loop)
                 return response.text.strip() if response.text else ""
                 
             except Exception as e:
                 time.sleep(5)
-                # The loop will now restart automatically
 
     def _get_private_context(self, player: Player) -> str:
         if player.private_memory:
             memory_log = "\n".join(player.private_memory)
             return f"\n🧠 YOUR INTERNAL MONOLOGUE & NOTES:\n{memory_log}\n"
         return ""
+
 
 class GameEngine:
     def __init__(self):
@@ -131,21 +182,26 @@ class GameEngine:
         return [
             Player("Madison", "Mafia", CONFIG["models"]["mafia"]),
             Player("Avery", "Mafia", CONFIG["models"]["mafia"]),
-            Player("Brooke", "Mafia", CONFIG["models"]["mafia"]),
+            Player("Anna", "Mafia", CONFIG["models"]["mafia"]),
             Player("Maddie", "Doctor", CONFIG["models"]["doctor"]),
             Player("Valentina", "Detective", CONFIG["models"]["detective"]),
             Player("Amber", "Town", CONFIG["models"]["town"]),
             Player("Elena", "Town", CONFIG["models"]["town"]),
             Player("Ariana", "Town", CONFIG["models"]["town"]),
-            Player("Tate", "Town", CONFIG["models"]["town"]),
+            Player("Sava", "Town", CONFIG["models"]["town"]),
             Player("Summer", "Town", CONFIG["models"]["town"]),
             Player("Natalie", "Town", CONFIG["models"]["town"]),
         ]
 
+    def _strip_ansi(self, text: str) -> str:
+        """Removes ANSI escape codes from a string for clean history logging."""
+        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        return ansi_escape.sub('', text)
+
     def log(self, message: str, to_console: bool = True, to_shared_history: bool = True):
-        """Adds to internal history and prints to CLI."""
+        """Adds to internal history (clean) and prints to CLI (colored)."""
         if to_shared_history:
-            self.shared_history.append(message)
+            self.shared_history.append(self._strip_ansi(message))
         if to_console:
             print(f"{message}")
 
@@ -158,12 +214,11 @@ class GameEngine:
         return None
 
     def _get_valid_action_response(self, actor: Player, prompt: str, candidates: List[str]) -> Union[Player, str, None]:
-        """Loops until LLM returns a valid player name or retries run out."""
         candidate_str = ", ".join(candidates)
         base_prompt = f"{prompt} Valid targets are: [{candidate_str}]."
         current_prompt = base_prompt
         
-        while True: # retry counter could go here
+        while True:
             response = self.llm.generate(actor, "\n".join(self.shared_history), current_prompt, distinct_action=True, all_players=self.players)
             if "Skip" in candidates and response.lower() == "skip":
                 return "Skip"
@@ -172,15 +227,12 @@ class GameEngine:
             if target and target.name in candidates:
                 return target
             
-            print(f"   (Retrying {actor.name} due to invalid output: '{response}')")
+            print(f"      [!] Retrying {actor.colored_name} due to invalid output: '{response}'")
             current_prompt = (
                 f"{base_prompt}\n\n"
                 f"SYSTEM ERROR: You replied '{response}', which is NOT a valid target. "
                 f"Please output ONLY a name from this exact list: [{candidate_str}]."
             )
-        
-        print(f"   (Failed to get valid input from {actor.name}. Skipping action.)")
-        return None
 
     def _get_inner_thoughts(self, actor: Player, prompt: str):
         response = self.llm.generate(
@@ -190,125 +242,123 @@ class GameEngine:
             all_players=self.players
         )
         actor.private_memory.append(f"Thought (Day {self.day_count}): {response}")
-        self.log(f"({actor.name}'s inner thought): {response}", to_console=True, to_shared_history=False)
+        self.log(f"  💭 [{actor.colored_name} thinking]: {response}", to_console=True, to_shared_history=False)
+
+    # --- NIGHT PHASE HELPERS ---
+
+    def _night_mafia_phase(self, alive_players, alive_names) -> Optional[Player]:
+        alive_mafia = [p for p in alive_players if p.role == "Mafia"]
+        if not alive_mafia:
+            return None
+
+        if len(alive_mafia) > 1:
+            conspirators = ', '.join(p.colored_name for p in alive_mafia)
+            self.log(f"\n  🌑 The Mafia ({conspirators}) are conspiring...", to_shared_history=False)
+            mafia_chat_history = []
+            
+            for round_num in range(CONFIG["mafia_discussion_rounds_per_night"]):
+                for m_player in alive_mafia:
+                    chat_context = "\n".join(mafia_chat_history[-4:]) 
+                    statement = self.llm.generate(
+                        m_player,
+                        f"Night {self.day_count} Mafia Chat:\n{chat_context}",
+                        "Discuss with your fellow Mafia members who to kill tonight. Be strategic. Keep it brief (1 sentence).",
+                        all_players=self.players
+                    )
+                    
+                    msg = f"Night {self.day_count} - {m_player.name} (Mafia Chat): {statement}"
+                    mafia_chat_history.append(msg)
+                    self.log(f"    💬 [{m_player.colored_name}]: {statement}", to_shared_history=False)
+                    
+                    for obs in alive_mafia:
+                        obs.private_memory.append(msg)
+
+            mafia_killer = random.choice(alive_mafia)
+            self.log(f"  🔪 {mafia_killer.colored_name} steps forward to perform the hit.", to_shared_history=False)
+        else:
+            mafia_killer = alive_mafia[0]
+            self.log(f"\n  🌑 {mafia_killer.colored_name} is choosing a target...", to_shared_history=False)
+            self._get_inner_thoughts(mafia_killer, "Who is the biggest threat to you right now?")
+
+        target_kill = self._get_valid_action_response(
+            mafia_killer, 
+            "Who do you want to KILL tonight?", 
+            [n for n in alive_names if n != mafia_killer.name]
+        )
+        if target_kill:
+            self.log(f"  🎯 The Mafia has targeted {target_kill.colored_name}.", to_shared_history=False)
+            
+        return target_kill
+
+    def _night_doctor_phase(self, alive_players, alive_names):
+        doctor = next((p for p in alive_players if p.role == "Doctor"), None)
+        if not doctor:
+            return
+
+        self.log(f"\n  ⚕️  {doctor.colored_name} is choosing a patient...", to_shared_history=False)
+        valid_saves = [n for n in alive_names if n != doctor.last_protected_target]
+        
+        self._get_inner_thoughts(doctor, "Who will you save tonight and why?")
+        target_save = self._get_valid_action_response(
+            doctor, 
+            "Who do you want to SAVE tonight?", 
+            valid_saves
+        )
+        
+        if target_save and isinstance(target_save, Player):
+            target_save.is_protected = True
+            self.log(f"  🛡️  The Doctor is protecting {target_save.colored_name}.", to_shared_history=False)
+            doctor.last_protected_target = target_save.name
+
+    def _night_detective_phase(self, alive_players, alive_names):
+        detective = next((p for p in alive_players if p.role == "Detective"), None)
+        if not detective:
+            return
+
+        self.log(f"\n  🔎 {detective.colored_name} is investigating a suspect...", to_shared_history=False)
+        self._get_inner_thoughts(detective, "Who will you investigate tonight and why?")
+        
+        target_investigate = self._get_valid_action_response(
+            detective, 
+            "Who do you want to INVESTIGATE?", 
+            [n for n in alive_names if n != detective.name]
+        )
+        
+        if target_investigate and isinstance(target_investigate, Player):
+            result = "Mafia" if target_investigate.role == "Mafia" else "Innocent"
+            directive = f"Do everything you can to eliminate {target_investigate.name}" if target_investigate.role == 'Mafia' else "Remember that this person is innocent."
+            note = f"Night {self.day_count}: Investigated {target_investigate.name}. Result: {result}. {directive}"
+            detective.private_memory.append(note)
+            self.log(f"  🔍 (Detective discovered that {target_investigate.colored_name} is {result})", to_shared_history=False)
 
     # --- PHASES ---
 
     def run_night_phase(self):
-        #time.sleep(60) # Prevent running out of prompts per minute
         self.day_count += 1
-        header = f"\n=== NIGHT {self.day_count} ===\n"
-        self.log(header)
+        self.log(f"\n{'='*40}\n🌙  NIGHT {self.day_count}\n{'='*40}")
 
-        # 1. Reset protection
         for p in self.players:
             p.is_protected = False
 
         alive_players = [p for p in self.players if p.is_alive]
         alive_names = [p.name for p in alive_players]
 
-        # 2. Mafia Action
-        alive_mafia = [p for p in alive_players if p.role == "Mafia"]
-        target_kill = None
-        
-        if alive_mafia:
-            mafia_killer = None
-            
-            # --- MULTI-MAFIA CHAT LOGIC ---
-            if len(alive_mafia) > 1:
-                print(f"🌑 The Mafia ({', '.join(p.name for p in alive_mafia)}) are conspiring...")
-                mafia_chat_history = []
-                
-                for round_num in range(CONFIG["mafia_discussion_rounds_per_night"]):
-                    for m_player in alive_mafia:
-                        # Construct context for the chat (including what peers just said)
-                        chat_context = "\n".join(mafia_chat_history[-4:]) # Keep recent context
-                        
-                        statement = self.llm.generate(
-                            m_player,
-                            f"Night {self.day_count} Mafia Chat:\n{chat_context}",
-                            "Discuss with your fellow Mafia members who to kill tonight. Be strategic. Keep it brief (1 sentence).",
-                            all_players=self.players
-                        )
-                        
-                        # Format message
-                        msg = f"Night {self.day_count} - {m_player.name} (Mafia Chat): {statement}"
-                        mafia_chat_history.append(msg)
-                        print(f"{m_player.name}: {statement}")
-                        
-                        # Add to EVERY mafia member's private memory so they remember the plan
-                        for obs in alive_mafia:
-                            obs.private_memory.append(msg)
+        target_kill = self._night_mafia_phase(alive_players, alive_names)
+        self._night_doctor_phase(alive_players, alive_names)
+        self._night_detective_phase(alive_players, alive_names)
 
-                # Select a random mafia member to execute the kill
-                mafia_killer = random.choice(alive_mafia)
-                print(f"🌑 {mafia_killer.name} steps forward to perform the hit.")
-
-            # --- SINGLE MAFIA LOGIC ---
-            else:
-                mafia_killer = alive_mafia[0]
-                print(f"🌑 {mafia_killer.name} is choosing a target...")
-                # Only use inner thoughts if alone (if group, they already discussed)
-                self._get_inner_thoughts(mafia_killer, "Who is the biggest threat to you right now?")
-
-            # Perform the Kill Action (by the selected killer)
-            target_kill = self._get_valid_action_response(
-                mafia_killer, 
-                "Who do you want to KILL tonight?", 
-                [n for n in alive_names if n != mafia_killer.name] # Can't kill self
-            )
-            self.log(f"🌑 The mafias will kill {target_kill.name}\n")
-
-        # 3. Doctor Action
-        doctor = next((p for p in alive_players if p.role == "Doctor"), None)
-        target_save = None
-        if doctor:
-            print("⚕️ Doctor is choosing a patient...")
-            valid_saves = [n for n in alive_names if n != doctor.last_protected_target]
-            
-            self._get_inner_thoughts(doctor, "Who will you save tonight and why?")
-            target_save = self._get_valid_action_response(
-                doctor, 
-                "Who do you want to SAVE tonight?", 
-                valid_saves
-            )
-            if target_save and isinstance(target_save, Player):
-                target_save.is_protected = True
-                self.log(f"⚕️ The doctor visited {target_save.name}\n")
-                doctor.last_protected_target = target_save.name
-
-        # 4. Detective Action
-        detective = next((p for p in alive_players if p.role == "Detective"), None)
-        if detective:
-            print("🔎 Detective is investigating...")
-            self._get_inner_thoughts(detective, "Who will you investigate tonight and why?")
-            
-            target_investigate = self._get_valid_action_response(
-                detective, 
-                "Who do you want to INVESTIGATE?", 
-                [n for n in alive_names if n != detective.name]
-            )
-            if target_investigate and isinstance(target_investigate, Player):
-                result = "Mafia" if target_investigate.role == "Mafia" else "Innocent"
-                note = f"Night {self.day_count}: Investigated {target_investigate.name}. Result: {result}. {f"Do everything you can to eliminate {target_investigate.name}" if target_investigate.role == 'Mafia' else f"Remember that this person is innocent."}"
-                detective.private_memory.append(note)
-                print(f"🔎 (Detective found that {target_investigate.name} is {result})")
-
-        # 5. Resolve Night
-        self.log("\n--- MORNING REPORT ---")
+        self.log(f"\n{'-'*40}\n🌅  MORNING REPORT\n{'-'*40}")
         if target_kill and isinstance(target_kill, Player):
             if target_kill.is_protected:
-                self.log(f"🌑 Mafia attacked {target_kill.name}, but they were saved by the Doctor!")
+                self.log(f"  🩸 Mafia attacked {target_kill.colored_name}, but they were saved by the Doctor!")
             else:
                 target_kill.is_alive = False
-                self.log(f"🪦 {target_kill.name} was found dead this morning.")
+                self.log(f"  🪦 {target_kill.colored_name} was found dead this morning.")
         else:
-            self.log("The night was quiet.")
+            self.log("  🕊️ The night was quiet. No one died.")
 
     def run_day_phase(self):
-        #time.sleep(60) # Prevent running out of prompts per minute
-        header = f"\n=== DAY {self.day_count} ===\n"
-        self.log(header)
+        self.log(f"\n{'='*40}\n☀️  DAY {self.day_count}\n{'='*40}")
         
         if self.check_win_condition(): return
 
@@ -316,27 +366,21 @@ class GameEngine:
         
         # 1. Discussion Rounds
         for round_num in range(CONFIG["discussion_rounds_per_day"]):
-            self.log(f"\n--- Discussion Round {round_num + 1} ---")
+            self.log(f"\n  {'-'*10} Discussion Round {round_num + 1} {'-'*10}\n")
             for player in alive:
-                if not player.is_alive: continue 
-                
-                print(f"💬 {player.name} is thinking...")
                 statement = self.llm.generate(
                     player, 
                     "\n".join(self.shared_history), 
                     "Discuss the recent events and who you suspect. Keep it under 2 sentences. YOUR RESPONSE HERE WILL NOT BE A PRIVATE MESSAGE TO OTHER MAFIA. EVERY PLAYER WILL SEE YOUR RESPONSE TO THIS ONE. DO NOT ADD ANY SELF-INCRIMINATING COMMENTS OR THOUGHTS TO YOUR RESPONSE. Detective, reference your notes when deciding who to discuss/accuse for.",
                     all_players=self.players
                 )
-                self.log(f"[{player.name}]: {statement}")
-                print('\n')
-            #time.sleep(60) # Prevent running out of prompts per minute
+                self.log(f"  🗣️ [{player.colored_name}]: {statement}")
+
         # 2. Voting
-        self.log("\n--- VOTING TIME ---")
+        self.log(f"\n  {'-'*10} VOTING PHASE {'-'*10}\n")
         votes = {}
         
         for player in alive:
-            print(f"🗳️ {player.name} is voting...")
-            # Think first
             self._get_inner_thoughts(player, "Who do you want to vote for and why?")
             
             vote_target = self._get_valid_action_response(
@@ -347,15 +391,15 @@ class GameEngine:
             
             if vote_target == "Skip":
                 votes["Skip"] = votes.get("Skip", 0) + 1
-                self.log(f"{player.name} voted to Skip.")
+                self.log(f"  🤚 {player.colored_name} voted to Skip.")
             elif vote_target:
                 votes[vote_target.name] = votes.get(vote_target.name, 0) + 1
-                self.log(f"{player.name} voted for {vote_target.name}")
+                self.log(f"  ⚖️ {player.colored_name} voted for {vote_target.colored_name}.")
             else:
-                self.log(f"{player.name} abstained.")
-            #time.sleep(60)
+                self.log(f"  🤚 {player.colored_name} abstained.")
 
         # 3. Resolve Vote
+        self.log(f"\n  {'-'*10} VOTE RESOLUTION {'-'*10}\n")
         if votes:
             max_votes = max(votes.values())
             candidates = [name for name, count in votes.items() if count == max_votes]
@@ -363,37 +407,37 @@ class GameEngine:
             if len(candidates) == 1:
                 victim_name = candidates[0]
                 if victim_name == "Skip":
-                    self.log("\n⚖️ The town voted to Skip. No one was executed.")
+                    self.log("  🏳️ The town voted to Skip. No one was executed.")
                 else:
                     victim = self.get_player_by_name(victim_name)
                     if victim:
                         victim.is_alive = False
-                        self.log(f"\n⚖️ The town has decided. {victim.name} is executed. {victim.name}'s role was: {victim.role}")
+                        self.log(f"  🪓 The town has decided. {victim.colored_name} is executed.\n  🎭 Their role was: {victim.role}")
             else:
-                self.log("\n⚖️ The vote was tied. No one was executed.")
+                self.log("  ⚖️ The vote was tied. No one was executed.")
         else:
-            self.log("\n⚖️ No votes were cast.")
+            self.log("  ⚖️ No votes were cast.")
 
     def check_win_condition(self) -> bool:
         mafia = [p for p in self.players if p.role == "Mafia" and p.is_alive]
         innocent = [p for p in self.players if p.role != "Mafia" and p.is_alive]
 
         if not mafia:
-            self.log("\n🏆 GAME OVER: The Innocents have won!")
+            self.log(f"\n{'='*40}\n🏆 GAME OVER: The Innocents have won!\n{'='*40}")
             self.is_game_over = True
-            buns = input(">")
+            input(">")
             return True
         
         if len(mafia) >= len(innocent):
-            self.log("\n🏆 GAME OVER: The Mafia has taken over the town!")
+            self.log(f"\n{'='*40}\n🏆 GAME OVER: The Mafia has taken over the town!\n{'='*40}")
             self.is_game_over = True
-            buns = input(">")
+            input(">")
             return True
         
         return False
 
     def start(self):
-        print("Starting Mafia Simulation...\n\n")
+        print("\nStarting Mafia Simulation...\n")
         while not self.is_game_over:
             self.run_night_phase()
             if self.check_win_condition(): break
