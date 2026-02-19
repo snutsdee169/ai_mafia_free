@@ -1,0 +1,4 @@
+termcolor
+google-genai
+dataclasses
+typing
