@@ -9,7 +9,7 @@ from google import genai
 # --- CONFIGURATION ---
 CONFIG = {
     # Replace with your actual key
-    "api_key": "AIzaSyBoHKLKTLVrixkoQmZ8sp4wSluvZ6RjGkc", 
+    "api_key": "API_KEY_HERE", 
     
     # Game Settings
     "discussion_rounds_per_day": 2,
